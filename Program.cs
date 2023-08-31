@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Threading;
 using YamlDotNet.Helpers;
 using YamlDotNet.RepresentationModel;
 
@@ -9,45 +10,50 @@ namespace DynmapMarkerPrune
 {
     internal class Program
     {
-        private enum MarkerPruneMode
-        {
-            REMOVE_SELECTION_INCLUSIVE,
-            REMOVE_SELECTION_EXCLUSIVE
-        }
+        // Config.
+        private static MarkerPruneMode pruneMode = MarkerPruneMode.REMOVE_SELECTION_EXCLUSIVE;
+        private static string markersYamlFilePath = "markers.yml";
+        private static string markersYamlOutputFilePath = "markers_pruned.yml";
+        private static string selectionsCsvFilePath = "selections.csv";
         
-        private const MarkerPruneMode PRUNE_MODE = MarkerPruneMode.REMOVE_SELECTION_EXCLUSIVE;
-        
-        private const string MARKERS_YAML_FILE_PATH = "markers.yml";
-        private const string MARKERS_YAML_OUTPUT_FILE_PATH = "markers_out.yml";
-        private const string REGIONS_FILE_PATH = "regions.csv";
-
+        // Runtime.
+        private static int processedMarkersCount;
         private static IOrderedDictionary<YamlNode, YamlNode> circles;
         private static IOrderedDictionary<YamlNode, YamlNode> markers;
-
-        private static int processedMarkersCount;
-
+        private static readonly List<SelectionArea> Selections = new List<SelectionArea>();
         private static readonly YamlScalarNode WorldNodeReference = new YamlScalarNode("world");
         private static readonly Dictionary<string, string> MarkersToDelete = new Dictionary<string, string>();
 
 
-        private static void Main()
+        private static void Main(string[] args)
         {
-            if (!File.Exists(MARKERS_YAML_FILE_PATH))
+            if(!TryParseArguments(args))
+                return;
+            
+            if (!File.Exists(markersYamlFilePath))
             {
                 Console.WriteLine("Missing markers.yml -file.");
                 return;
             }
             
-            LoadAllMarkers();
+            if (!File.Exists(selectionsCsvFilePath))
+            {
+                Console.WriteLine("Missing selections.csv -file.");
+                return;
+            }
+            
+            LoadMarkers();
 
-            // Load regions.csv
-            string[] selectedRegionsAndChunks = File.ReadAllLines(REGIONS_FILE_PATH);
+            LoadSelectionAreas();
 
             int markersTotalCount = circles.Count + markers.Count;
+            
+            Console.WriteLine($"Start pruning {markersTotalCount} markers with prune mode {pruneMode}...");
+            Thread.Sleep(1000);
 
             foreach (KeyValuePair<YamlNode,YamlNode> markerNode in circles)
             {
-                ProcessMarkerNode(markerNode, selectedRegionsAndChunks);
+                ProcessMarkerNode(markerNode);
 
                 processedMarkersCount++;
                 
@@ -57,7 +63,7 @@ namespace DynmapMarkerPrune
 
             foreach (KeyValuePair<YamlNode,YamlNode> markerNode in markers)
             {
-                ProcessMarkerNode(markerNode, selectedRegionsAndChunks);
+                ProcessMarkerNode(markerNode);
 
                 processedMarkersCount++;
                 
@@ -77,61 +83,118 @@ namespace DynmapMarkerPrune
 
             Console.WriteLine($"Found {MarkersToDelete.Count} markers to delete out of {markersTotalCount} markers in total.");
                 
-            SaveModifiedYamlWithDeletedMarkers(MARKERS_YAML_OUTPUT_FILE_PATH);
+            SaveModifiedYaml(markersYamlOutputFilePath);
             
             Console.WriteLine("Done!");
             Console.ReadKey();
         }
 
 
-        private static void ProcessMarkerNode(KeyValuePair<YamlNode, YamlNode> markerNode, string[] selectedRegionsAndChunks)
+        private static bool TryParseArguments(IReadOnlyList<string> args)
+        {
+            if (args.Count == 0)
+            {
+                Console.WriteLine("No arguments provided, using default values...");
+                return true;
+            }
+            
+            if (args.Count != 4)
+            {
+                Console.WriteLine("Invalid argument count provided, using default values...");
+                Console.WriteLine("Argument order -> markers_path selections_path output_path prune_mode (inclusive or exclusive)");
+                return false;
+            }
+
+            markersYamlFilePath = args[0];
+            selectionsCsvFilePath = args[1];
+            markersYamlOutputFilePath = args[2];
+            pruneMode = args[3] == "inclusive" ? MarkerPruneMode.REMOVE_SELECTION_INCLUSIVE : MarkerPruneMode.REMOVE_SELECTION_EXCLUSIVE;
+            
+            return true;
+        }
+
+
+        private static void LoadMarkers()
+        {
+            // Read the YAML file.
+            string markersYamlContent = File.ReadAllText(markersYamlFilePath);
+
+            // Parse the YAML content.
+            StringReader input = new StringReader(markersYamlContent);
+            YamlStream yamlStream = new YamlStream();
+            yamlStream.Load(input);
+
+            // Get the root mapping node.
+            YamlMappingNode rootNode = (YamlMappingNode)yamlStream.Documents[0].RootNode;
+
+            YamlMappingNode sets = (YamlMappingNode)rootNode["sets"];
+            IOrderedDictionary<YamlNode, YamlNode> markersRoot = ((YamlMappingNode)sets["markers"]).Children;
+            markers = ((YamlMappingNode)markersRoot["markers"]).Children;
+            circles = ((YamlMappingNode)markersRoot["circles"]).Children;
+            
+            Console.WriteLine($"{markersYamlFilePath} loaded...");
+        }
+
+
+        private static void LoadSelectionAreas()
+        {
+            string[] selectedRegionsAndChunks = File.ReadAllLines(selectionsCsvFilePath);
+            
+            foreach (string line in selectedRegionsAndChunks)
+            {
+                string[] parts = line.Split(';');
+                switch (parts.Length)
+                {
+                    case 2:
+                    {
+                        // This is a region.
+                        int regionX = int.Parse(parts[0]);
+                        int regionZ = int.Parse(parts[1]);
+                        
+                        Selections.Add(new SelectionArea(regionX, regionZ, 512));
+
+                        break;
+                    }
+                    case 4:
+                    {
+                        // This is a chunk.
+                        int chunkX = int.Parse(parts[2]);
+                        int chunkZ = int.Parse(parts[3]);
+                        
+                        Selections.Add(new SelectionArea(chunkX, chunkZ, 16));
+
+                        break;
+                    }
+                    default:
+                        throw new Exception("Unexpected selection file format, expected 2 or 4 coordinates per line.");
+                }
+            }
+            
+            Console.WriteLine($"{selectionsCsvFilePath} loaded...");
+        }
+
+
+        private static void ProcessMarkerNode(KeyValuePair<YamlNode, YamlNode> markerNode)
         {
             YamlMappingNode properties = (YamlMappingNode)markerNode.Value;
 
             if (!properties["world"].Equals(WorldNodeReference))
                 return;
 
-            (int x, int z) = GetCoordinates(properties);
+            (int x, int z) = GetCoordinatesFromYamlNode(properties);
 
-            foreach (string line in selectedRegionsAndChunks)
+            foreach (SelectionArea selection in Selections)
             {
-                bool isInclusive;
-
-                string[] parts = line.Split(';');
-                switch (parts.Length)
-                {
-                    case 2:
-                    {
-                        // This is a region
-                        int regionX = int.Parse(parts[0]);
-                        int regionZ = int.Parse(parts[1]);
-
-                        isInclusive = IsMarkerInRegion(regionX, regionZ, x, z);
-                        break;
-                    }
-                    case 4:
-                    {
-                        // This is a chunk
-                        int chunkX = int.Parse(parts[2]);
-                        int chunkZ = int.Parse(parts[3]);
-
-                        isInclusive = IsMarkerInChunk(chunkX, chunkZ, x, z);
-                        break;
-                    }
-                    default:
-                        throw new Exception("What?");
-                }
-
-                if (isInclusive)
-                {
-                    if(PRUNE_MODE == MarkerPruneMode.REMOVE_SELECTION_INCLUSIVE)
-                        AddMarkerForDeletion(markerNode, properties, x, z);
+                if (!selection.ContainsPosition(x, z))
+                    continue;
+                
+                if(pruneMode == MarkerPruneMode.REMOVE_SELECTION_INCLUSIVE)
+                    AddMarkerForDeletion(markerNode, properties, x, z);
                     
-                    return;
-                }
+                return;
             }
             
-            if(PRUNE_MODE == MarkerPruneMode.REMOVE_SELECTION_EXCLUSIVE)
+            if(pruneMode == MarkerPruneMode.REMOVE_SELECTION_EXCLUSIVE)
                 AddMarkerForDeletion(markerNode, properties, x, z);
         }
 
@@ -147,69 +210,18 @@ namespace DynmapMarkerPrune
         }
 
 
-        private static void LoadAllMarkers()
-        {
-            // Read the YAML file
-            string markersYamlContent = File.ReadAllText(MARKERS_YAML_FILE_PATH);
-
-            // Parse the YAML content
-            StringReader input = new StringReader(markersYamlContent);
-            YamlStream yamlStream = new YamlStream();
-            yamlStream.Load(input);
-
-            // Get the root mapping node.
-            YamlMappingNode rootNode = (YamlMappingNode)yamlStream.Documents[0].RootNode;
-
-            YamlMappingNode sets = (YamlMappingNode)rootNode["sets"];
-            IOrderedDictionary<YamlNode, YamlNode> markersRoot = ((YamlMappingNode)sets["markers"]).Children;
-            markers = ((YamlMappingNode)markersRoot["markers"]).Children;
-            circles = ((YamlMappingNode)markersRoot["circles"]).Children;
-            
-            Console.WriteLine("markers.yml loaded...");
-        }
-
-
-        private static bool IsMarkerInRegion(int regionX, int regionZ, int markerX, int markerZ)
-        {
-            int startX = regionX * 512;
-            int startZ = regionZ * 512;
-            int endX = startX + 512;
-            int endZ = startZ + 512;
-
-            return CheckMarkerRectOverlap(startX, startZ, endX, endZ, markerX, markerZ);
-        }
-
-
-        private static bool IsMarkerInChunk(int chunkX, int chunkZ, int markerX, int markerZ)
-        {
-            int startX = chunkX * 16;
-            int startZ = chunkZ * 16;
-            int endX = startX + 16;
-            int endZ = startZ + 16;
-
-            return CheckMarkerRectOverlap(startX, startZ, endX, endZ, markerX, markerZ);
-        }
-
-
-        private static bool CheckMarkerRectOverlap(int rectMinX, int rectMinZ, int rectMaxX, int rectMaxZ, int markerX, int markerZ)
-        {
-            return markerX >= rectMinX && markerX < rectMaxX && markerZ >= rectMinZ && markerZ < rectMaxZ;
-        }
-
-
-        private static (int x, int z) GetCoordinates(YamlMappingNode node)
+        private static (int x, int z) GetCoordinatesFromYamlNode(YamlMappingNode node)
         {
             return ((int)double.Parse(node["x"].ToString(), CultureInfo.InvariantCulture),
                 (int)double.Parse(node["z"].ToString(), CultureInfo.InvariantCulture));
         }
         
         
-        private static void SaveModifiedYamlWithDeletedMarkers(string outputPath)
+        private static void SaveModifiedYaml(string outputPath)
         {
-            // Read the YAML file
-            string markersYamlContent = File.ReadAllText(MARKERS_YAML_FILE_PATH);
+            string markersYamlContent = File.ReadAllText(markersYamlFilePath);
 
-            // Parse the YAML content
+            // Parse the YAML content.
             StringReader input = new StringReader(markersYamlContent);
             YamlStream yamlStream = new YamlStream();
             yamlStream.Load(input);
@@ -238,37 +250,40 @@ namespace DynmapMarkerPrune
             YamlMappingNode mSets = (YamlMappingNode)rootNode["sets"];
             IOrderedDictionary<YamlNode, YamlNode> mMarkersRoot = ((YamlMappingNode)mSets["markers"]).Children;
     
-            // Remove markers from the new YamlMappingNode
-            foreach ((YamlNode markerKeyToDelete, YamlNode label) in nodesToRemove)
+            // Remove markers from the new YamlMappingNode.
+            foreach ((YamlNode markerKeyToDelete, YamlNode _) in nodesToRemove)
             {
-                if (((YamlMappingNode)mMarkersRoot["markers"]).Children.ContainsKey(markerKeyToDelete))
+                YamlMappingNode markersRootNode = (YamlMappingNode)mMarkersRoot["markers"];
+                if (markersRootNode.Children.ContainsKey(markerKeyToDelete))
                 {
-                    ((YamlMappingNode)mMarkersRoot["markers"]).Children.Remove(markerKeyToDelete);
-                    //Console.WriteLine($"Removed marker: {markerKeyToDelete} ({label})");
+                    markersRootNode.Children.Remove(markerKeyToDelete);
                 }
-                else if (((YamlMappingNode)mMarkersRoot["circles"]).Children.ContainsKey(markerKeyToDelete))
+                else
                 {
-                    ((YamlMappingNode)mMarkersRoot["circles"]).Children.Remove(markerKeyToDelete);
-                    //Console.WriteLine($"Removed marker: {markerKeyToDelete} ({label})");
+                    YamlMappingNode circlesRootNode = (YamlMappingNode)mMarkersRoot["circles"];
+                    if (circlesRootNode.Children.ContainsKey(markerKeyToDelete))
+                    {
+                        circlesRootNode.Children.Remove(markerKeyToDelete);
+                    }
                 }
             }
             
-            // Create a new YamlStream to hold the modified data
+            // Create a new YamlStream to hold the modified data.
             YamlStream modifiedYamlStream = new YamlStream();
     
-            // Clone the original YAML's root node to the modified stream
+            // Clone the original YAML's root node to the modified stream.
             modifiedYamlStream.Documents.Add(new YamlDocument(rootNode));
     
-            // Save the modified YAML to a new file
+            // Save the modified YAML to a new file.
             using (StreamWriter writer = File.CreateText(outputPath))
             {
+                // Add the YAML prefix.
                 writer.WriteLine("%YAML 1.1");
                 writer.WriteLine("---");
                 modifiedYamlStream.Save(writer, assignAnchors: false);
             }
-            //TODO: Remove the three dots that are generated at the end of the document.
 
-            Console.WriteLine($"Modified YAML with deleted markers saved to: {outputPath}");
+            Console.WriteLine($"Modified YAML saved to: {outputPath}");
         }
     }
 }
